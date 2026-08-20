@@ -1,3 +1,5 @@
+from itertools import combinations
+
 import numpy as np
 import torch
 
@@ -264,6 +266,183 @@ def get_expected_payoff_matrix(
 
     payoff = share_ask * profit_ask + share_bid * profit_bid
     return payoff
+
+
+# Position of each quote inside an action, so that callers never have to rely on
+# the order of the pair. The theory usually writes a quote ask first.
+BID, ASK = 0, 1
+
+
+def get_bid(actions: torch.Tensor) -> torch.Tensor:
+    """Extract the bid of each action.
+
+    Parameters
+    ----------
+    actions : torch.Tensor
+        Tensor of shape ``(..., 2)`` holding ``(bid, ask)`` pairs.
+
+    Returns
+    -------
+    bid : torch.Tensor
+        Tensor of shape ``(...)``.
+    """
+    return actions[..., BID]
+
+
+def get_ask(actions: torch.Tensor) -> torch.Tensor:
+    """Extract the ask of each action.
+
+    Parameters
+    ----------
+    actions : torch.Tensor
+        Tensor of shape ``(..., 2)`` holding ``(bid, ask)`` pairs.
+
+    Returns
+    -------
+    ask : torch.Tensor
+        Tensor of shape ``(...)``.
+    """
+    return actions[..., ASK]
+
+
+def get_market_error(
+    action_space: torch.Tensor | list[list[float]],
+    a_star: float,
+    b_star: float,
+) -> torch.Tensor:
+    r"""Distance of the realized market prices from a continuous benchmark.
+
+    Only the prices a trader can actually reach matter, so the error compares the
+    best ask and the best bid of the profile against the benchmark:
+
+    .. math:: D(q_1, q_2) = |\min(a_1, a_2) - a^*| + |\max(b_1, b_2) - b^*|.
+
+    This is deliberately not the distance of an individual quote from the
+    benchmark: a maker can sit far away on the side it never trades while the
+    realized prices are correct.
+
+    Parameters
+    ----------
+    action_space : torch.Tensor or list of list of float
+        Tensor of shape ``(n_arms, 2)`` containing the ``(bid, ask)`` arms.
+    a_star : float
+        Benchmark ask.
+    b_star : float
+        Benchmark bid.
+
+    Returns
+    -------
+    error : torch.Tensor
+        Tensor of shape ``(n_arms, n_arms)`` whose entry ``(i, j)`` is the error
+        of the profile where the row maker plays arm ``i`` and the column maker
+        arm ``j``. Symmetric, since the market prices do not depend on which
+        maker quoted them.
+    """
+    arms = torch.as_tensor(action_space, dtype=torch.float64)
+
+    best_ask = torch.minimum(get_ask(arms)[:, None], get_ask(arms)[None, :])
+    best_bid = torch.maximum(get_bid(arms)[:, None], get_bid(arms)[None, :])
+
+    return (best_ask - a_star).abs() + (best_bid - b_star).abs()
+
+
+def _solve_support(
+    payoff: torch.Tensor,
+    support: tuple[int, ...],
+    tol: float,
+) -> torch.Tensor | None:
+    """Symmetric equilibrium strategy on a given support, if one exists.
+
+    On the support every action must earn the same expected payoff, and no action
+    outside it may earn more.
+    """
+    n_arms = payoff.shape[0]
+    size = len(support)
+    index = list(support)
+
+    # Equal payoffs on the support, probabilities summing to one
+    left = torch.zeros((size + 1, size), dtype=torch.float64)
+    right = torch.zeros(size + 1, dtype=torch.float64)
+
+    block = payoff[index][:, index]
+    left[: size - 1] = block[: size - 1] - block[1:size]
+    left[size - 1 :] = 1.0
+    right[size - 1 :] = 1.0
+    left = left[: size + 1 - (1 if size > 1 else 0)]
+    right = right[: size + 1 - (1 if size > 1 else 0)]
+
+    try:
+        solution = torch.linalg.lstsq(left, right.unsqueeze(-1)).solution.squeeze(-1)
+    except RuntimeError:
+        return None
+
+    if (left @ solution - right).abs().max() > tol:
+        return None
+    if (solution < -tol).any():
+        return None
+
+    strategy = torch.zeros(n_arms, dtype=torch.float64)
+    strategy[index] = solution.clamp_min(0.0)
+    strategy = strategy / strategy.sum()
+
+    # No action outside the support may do strictly better
+    value = payoff @ strategy
+    if value.max() > value[index].mean() + tol:
+        return None
+    return strategy
+
+
+def get_mixed_nash(
+    payoff: torch.Tensor,
+    max_support: int | None = None,
+    tol: float = 1e-09,
+) -> list[dict]:
+    """Enumerate symmetric mixed Nash equilibria by support enumeration.
+
+    Every support up to `max_support` actions is tried, so the search is
+    exhaustive only when `max_support` reaches the number of actions. The
+    returned records state what was covered, since an empty result under a
+    bounded search is not evidence that no equilibrium exists.
+
+    Parameters
+    ----------
+    payoff : torch.Tensor
+        Payoff matrix of the row maker, of shape ``(n_arms, n_arms)``. The game
+        is assumed symmetric, so the column maker's matrix is its transpose.
+    max_support : int, optional
+        Largest support size considered. Defaults to every action, which costs
+        ``2 ** n_arms`` and is only feasible for small games.
+    tol : float, optional
+        Tolerance on the equal-payoff and best-response conditions.
+
+    Returns
+    -------
+    equilibria : list of dict
+        One entry per equilibrium found, each holding its ``support``,
+        ``strategy`` and the ``value`` every action in the support earns. Pure
+        equilibria appear as supports of size one.
+    """
+    n_arms = payoff.shape[0]
+    largest = n_arms if max_support is None else min(max_support, n_arms)
+
+    payoff = payoff.to(torch.float64)
+    equilibria = []
+
+    for size in range(1, largest + 1):
+        for support in combinations(range(n_arms), size):
+            strategy = _solve_support(payoff, support, tol)
+            if strategy is None:
+                continue
+
+            equilibria.append(
+                {
+                    "support": list(support),
+                    "strategy": strategy.tolist(),
+                    "value": float((payoff @ strategy)[list(support)].mean()),
+                }
+            )
+
+    return equilibria
 
 
 def get_pure_nash(payoff: torch.Tensor, tol: float = 0.0) -> torch.Tensor:
